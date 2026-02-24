@@ -234,7 +234,7 @@ def generate_grasps(
     workspace_mask: Optional[np.ndarray] = None,
     visual: bool = False,
 ) -> Tuple[List, o3d.geometry.PointCloud]:
-    """End-to-end: preprocess -> predict -> collision -> nms/sort -> select/rank."""
+    """preprocess -> predict -> collision -> nms/sort -> select/rank."""
     end_points, cloud = get_and_process_data(imgs, workspace_mask=workspace_mask)
 
     gg = get_grasps(net, end_points)
