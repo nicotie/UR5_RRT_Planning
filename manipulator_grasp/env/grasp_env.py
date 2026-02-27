@@ -29,6 +29,7 @@ class GraspEnv:
         self.sim_hz = 500
         self.mj_model: mujoco.MjModel = None
         self.mj_data: mujoco.MjData = None
+        self.dt = None
 
         self.model_roboplan = None
         self.collision_model = None
@@ -70,17 +71,23 @@ class GraspEnv:
         srdf_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'assets', 'ur5e_description', 'srdf', 'ur5e_2f85.srdf')
         self.model_roboplan, self.collision_model, visual_model = load_models(urdf_path)
         add_self_collisions(self.model_roboplan, self.collision_model, srdf_path)
-        self.obs_vis_ids, self.obs_col_ids = add_object_collisions(
-            self.model_roboplan, self.collision_model, visual_model, inflation_radius=0.01
-        )
-        self.obs_vis_ids = set(self.obs_vis_ids)
-        self.obs_col_ids = set(self.obs_col_ids)
 
         # --- scene ---
         filename = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'assets', 'scenes', 'grasp_env.xml')
         self.mj_model = mujoco.MjModel.from_xml_path(filename)
         self.mj_data = mujoco.MjData(self.mj_model)
         mujoco.mj_forward(self.mj_model, self.mj_data)
+
+        # --- collisions ---
+        self.obs_vis_ids, self.obs_col_ids = add_object_collisions(
+            self.model_roboplan, self.collision_model, visual_model, inflation_radius=0.0,
+            mj_model=self.mj_model, mj_data=self.mj_data
+        )
+        # add_object_collisions(
+        #     self.model_roboplan, self.collision_model, visual_model, inflation_radius=0.01
+        # )
+        self.obs_vis_ids = set(self.obs_vis_ids)
+        self.obs_col_ids = set(self.obs_col_ids)        
 
         # --- robot ---
         self.robot = UR5e()
@@ -158,7 +165,7 @@ class GraspEnv:
         self.T_TG = sm.SE3.Rt(T_TG_pin.rotation, T_TG_pin.translation)
 
         # --- for segmentation / obj gid ---
-        self.obj_geom_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, "Banana")
+        self.obj_geom_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, "Box")
         if self.obj_geom_id < 0:
             raise RuntimeError("Obj geom not found in XML")
         
@@ -206,7 +213,9 @@ class GraspEnv:
         self.mj_viewer.cam.distance = 1.2
         self.mj_viewer.sync()
 
-        print("[env] reset")
+        self.sim_dt = float(self.mj_model.opt.timestep)
+        self.execute_dt = self.sim_dt
+        print(f"[env] reset.")
 
     def get_planning_models(self):
         if self.model_roboplan is None or self.collision_model is None:

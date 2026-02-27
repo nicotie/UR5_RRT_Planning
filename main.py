@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from typing import Dict, Optional, Tuple, List
 
 import numpy as np
@@ -12,6 +13,7 @@ import pinocchio
 
 from graspnetAPI import GraspGroup
 
+from manipulator_grasp.planner.set_model import attach_grasped_object_mj_geom, disable_grasped_object_collisions
 from manipulator_grasp.planner.set_plan import getIk, get_traj
 from pyroboplan.core.utils import (
     check_collisions_at_state,
@@ -89,13 +91,13 @@ def get_and_process_data(
         cy = (height - 1) / 2.0
 
     factor_depth = 1.0
-    camera = CameraInfo(width, height, fx, fy, cx, cy, factor_depth)  # CameraInfo(width,height,fx,fy,cx,cy,scale) :contentReference[oaicite:1]{index=1}
+    camera = CameraInfo(width, height, fx, fy, cx, cy, factor_depth)  # CameraInfo(width,height,fx,fy,cx,cy,scale)
     cloud_organized = create_point_cloud_from_depth_image(depth, camera, organized=True)  # (H,W,3)
 
     # --- base valid mask ---
     valid = (depth > 1e-6) & (depth < 2.0)
 
-    # --- semantic segmentation: keep ONLY target geom points (banana) ---
+    # --- semantic segmentation: keep ONLY target geom points ---
     seg = imgs.get("seg", None)
     gid = int(imgs.get("obj_gid", -1))
     if seg is not None and gid >= 0:
@@ -234,7 +236,7 @@ def generate_grasps(
     workspace_mask: Optional[np.ndarray] = None,
     visual: bool = False,
 ) -> Tuple[List, o3d.geometry.PointCloud]:
-    """preprocess -> predict -> collision -> nms/sort -> select/rank."""
+    """End-to-end: preprocess -> predict -> collision -> nms/sort -> select/rank."""
     end_points, cloud = get_and_process_data(imgs, workspace_mask=workspace_mask)
 
     gg = get_grasps(net, end_points)
@@ -260,6 +262,7 @@ def execute_grasp(env, grasps: List, cloud: o3d.geometry.PointCloud) -> None:
     approach = 0.15
     lift = 0.15
     success = False
+    T_lift_sel = None
     q_traj1 = q_traj2 = q_traj3 = None
     q_goal1 = q_goal2 = q_goal3 = None
 
@@ -267,6 +270,7 @@ def execute_grasp(env, grasps: List, cloud: o3d.geometry.PointCloud) -> None:
     n_wp = np.array([0.0, 1.0, 0.0])
     o_wp = np.array([1.0, 0.0, -0.5])
     t_wp = np.array([0.65, 0.2, 0.9])
+    o_wp = o_wp / np.linalg.norm(o_wp)
     T_wp_g = sm.SE3.Trans(t_wp) * sm.SE3(sm.SO3.TwoVectors(x=n_wp, y=o_wp))
 
     T_wc = env.T_wc
@@ -283,9 +287,38 @@ def execute_grasp(env, grasps: List, cloud: o3d.geometry.PointCloud) -> None:
         return np.ascontiguousarray(q, dtype=np.float64).ravel()
 
     def run_traj(action: np.ndarray, q_traj: np.ndarray):
+        sim_dt = float(env.sim_dt)
+        vmax = float(getattr(env, "execute_vmax", 0.6))
+        t_next = time.perf_counter()
+        q_prev = None
+        est_time = 0.0
+        n_total_steps = 0
         for i in range(q_traj.shape[1]):
-            action[:6] = q_traj[:6, i]
-            env.step(action)
+            q_cmd = q_traj[:6, i].astype(np.float32, copy=False)
+
+            if q_prev is None:
+                n_hold = 1
+            else:
+                dq = float(np.max(np.abs(q_cmd - q_prev)))          # max joint delta
+                seg_t = dq / max(vmax, 1e-6)                        # seconds
+                n_hold = max(1, int(np.ceil(seg_t / sim_dt)))       # steps
+
+            q_prev = q_cmd.copy()
+            action[:6] = q_cmd
+
+            for _ in range(n_hold):
+                env.step(action)
+                n_total_steps += 1
+                est_time += sim_dt
+                # keep wall-clock ~ sim time
+                t_next += sim_dt
+                slack = t_next - time.perf_counter()
+                if slack > 0:
+                    time.sleep(slack)
+                else:
+                    t_next = time.perf_counter()
+
+        print(f"[run_traj] wp={q_traj.shape[1]} steps={n_total_steps} est={est_time:.3f}s vmax={vmax} sim_dt={sim_dt}")
 
     # --- start state check ---
     q_home = mj_to_pin_q(mj.mj_get_arm_q(env, arm_joint_names))
@@ -310,13 +343,15 @@ def execute_grasp(env, grasps: List, cloud: o3d.geometry.PointCloud) -> None:
                     break
         return
     
+    pad = float(getattr(env.rrt_options, "collision_distance_padding", 0.0))
+
     for g in grasps:
         R = np.asarray(g.rotation_matrix, dtype=np.float64)
         t = np.asarray(g.translation, dtype=np.float64)
 
         T_cg = sm.SE3.Trans(t) * sm.SE3(sm.SO3.TwoVectors(x=R[:, 0], y=R[:, 1]))
         T_wG = T_wc * T_cg
-        print("[grasp] z_w=", float(T_wG.t[2]),"approach_w=", (T_wG.R @ np.array([1.0,0.0,0.0])).ravel())
+        # print("[grasp] z_w=", float(T_wG.t[2]),"approach_w=", (T_wG.R @ np.array([1.0,0.0,0.0])).ravel())
         # pregrasp
         T_pre_g = T_wG * sm.SE3(-approach, 0.0, 0.0)
         # T_pre_g = T_wG * sm.SE3(0.0, 0.0, approach)
@@ -333,7 +368,7 @@ def execute_grasp(env, grasps: List, cloud: o3d.geometry.PointCloud) -> None:
         if q_goal1 is None:
             continue
         q_goal1 = np.ascontiguousarray(np.asarray(q_goal1, dtype=np.float64)).ravel()
-        if check_collisions_at_state(model_roboplan, collision_model, q_goal1):
+        if check_collisions_at_state(model_roboplan, collision_model, q_goal1, distance_padding=pad):
             continue
         q_traj1 = get_traj(env, q_home, q_goal1)
         if q_traj1 is None:
@@ -343,7 +378,7 @@ def execute_grasp(env, grasps: List, cloud: o3d.geometry.PointCloud) -> None:
         if q_goal2 is None:
             continue
         q_goal2 = np.ascontiguousarray(np.asarray(q_goal2, dtype=np.float64)).ravel()
-        if check_collisions_at_state(model_roboplan, collision_model, q_goal2):
+        if check_collisions_at_state(model_roboplan, collision_model, q_goal2, distance_padding=pad):
             continue
         q_traj2 = get_traj(env, q_goal1, q_goal2)
         if q_traj2 is None:
@@ -353,7 +388,7 @@ def execute_grasp(env, grasps: List, cloud: o3d.geometry.PointCloud) -> None:
         if q_goal3 is None:
             continue
         q_goal3 = np.ascontiguousarray(np.asarray(q_goal3, dtype=np.float64)).ravel()
-        if check_collisions_at_state(model_roboplan, collision_model, q_goal3):
+        if check_collisions_at_state(model_roboplan, collision_model, q_goal3, distance_padding=pad):
             continue
         q_traj3 = get_traj(env, q_goal2, q_goal3)
         if q_traj3 is None:
@@ -383,25 +418,90 @@ def execute_grasp(env, grasps: List, cloud: o3d.geometry.PointCloud) -> None:
     for _ in range(50):
         env.step(action)
 
-    # 4) move to place, then open, then back home
-    T_place = T_wp_g * T_GT  # place gripper pose -> tool pose
-    q_start4 = q_goal3
-    while True:
-        q_goal4 = getIk(env, q_start4, T_place)
-        if q_goal4 is None:
-            continue
-        q_goal4 = np.ascontiguousarray(np.asarray(q_goal4, dtype=np.float64)).ravel()
-        if check_collisions_at_state(model_roboplan, collision_model, q_goal4):
-            continue
-        q_traj4 = get_traj(env, q_start4, q_goal4)
-        if q_traj4 is None:
-            continue
-        q_traj5 = get_traj(env, q_goal4, q_home)
-        if q_traj5 is None:
-            continue
-        break
+    mujoco.mj_forward(env.mj_model, env.mj_data)  # update geom_xpos/xmat (global)
+    ok = attach_grasped_object_mj_geom(
+        model_roboplan,
+        collision_model,
+        env.mj_model,
+        env.mj_data,
+        obj_gid=env.obj_geom_id,
+        mj_tool_name=env.target_frame,   # "flange"
+        parent_frame=env.target_frame,   # "flange"
+        name="grasped_object",
+        inflation_radius=0.0,
+    )
+    if not ok:
+        print("[carry] attach grasped object failed")
+        return
 
-    run_traj(action, q_traj4)
+    env.ik.collision_data = collision_model.createData()
+    print(f"[carry] refresh ik collision_data: pairs={len(collision_model.collisionPairs)} results={len(env.ik.collision_data.collisionResults)}")
+
+    # 4) move to place, then open, then back home
+    q_start4 = mj_to_pin_q(mj.mj_get_arm_q(env, arm_joint_names))
+
+    T_place_pre = (sm.SE3(0.0, 0.0, 0.15) * T_wp_g) * T_GT
+    T_place     = T_wp_g * T_GT
+
+    q_traj4a = q_traj4b = q_traj5 = None
+    q_goal4a = q_goal4b = None
+
+    # only for traj4
+    env.rrt_options.max_planning_time = 20.0
+    env.rrt_options.rrt_connect = True
+    env.rrt_options.bidirectional_rrt = True
+    env.rrt_options.rrt_star = False
+    env.rrt_options.max_step_size = 0.06    # 0.02
+    env.rrt_options.max_connection_dist = 0.8
+    env.rrt_options.goal_biasing_probability = 0.4
+
+    for k in range(30):
+        # --- pre-place IK ---
+        q_goal4a = getIk(env, q_start4, T_place_pre)
+        if q_goal4a is None:
+            print(f"[place] IK pre failed k={k}")
+            continue
+        q_goal4a = np.ascontiguousarray(np.asarray(q_goal4a, dtype=np.float64)).ravel()
+        if check_collisions_at_state(model_roboplan, collision_model, q_goal4a, distance_padding=pad):
+            print(f"[place] IK pre in collision k={k}")
+            continue
+
+        q_traj4a = get_traj(env, q_start4, q_goal4a)
+        if q_traj4a is None:
+            print(f"[place] RRT pre failed k={k}")
+            continue
+
+        q_goal4b = getIk(env, q_goal4a, T_place)
+        if q_goal4b is None:
+            print(f"[place] IK down failed k={k}")
+            continue
+        q_goal4b = np.ascontiguousarray(np.asarray(q_goal4b, dtype=np.float64)).ravel()
+        if check_collisions_at_state(model_roboplan, collision_model, q_goal4b, distance_padding=pad):
+            print(f"[place] IK down in collision k={k}")
+            continue
+
+        q_traj4b = get_traj(env, q_goal4a, q_goal4b)
+        if q_traj4b is None:
+            print(f"[place] RRT down failed k={k}")
+            continue
+
+        # --- back home ---
+        q_traj5a = get_traj(env, q_goal4b, q_goal4a)
+        if q_traj5a is None:
+            print(f"[place] RRT retreat failed k={k}")
+            continue
+        q_traj5b = get_traj(env, q_goal4a, q_home)
+        if q_traj5b is None:
+            print(f"[place] RRT home failed k={k}")
+            continue
+
+        break
+    else:
+        print("[place] failed after 30 tries")
+        return
+
+    run_traj(action, q_traj4a)
+    run_traj(action, q_traj4b)
 
     for _ in range(1500):
         action[-1] = np.float32(max(float(action[-1]) - 0.2, 0.0))
@@ -409,7 +509,12 @@ def execute_grasp(env, grasps: List, cloud: o3d.geometry.PointCloud) -> None:
     for _ in range(50):
         env.step(action)
 
-    run_traj(action, q_traj5)
+    # release object collision
+    disable_grasped_object_collisions(model_roboplan, collision_model, name="grasped_object")
+    env.ik.collision_data = collision_model.createData()
+
+    run_traj(action, q_traj5a)
+    run_traj(action, q_traj5b)
     for _ in range(50):
         env.step(action)
 

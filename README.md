@@ -3,6 +3,9 @@
 ## Overview
 This project demonstrates collision-free planning using the UR5 robot arm in MuJoCo, utilizing `RRT`.
 
+## Changelog
+- Add gripper and object collision for path planning.
+
 ## Workspace
 ![workspace](media/demo.png)
 
